@@ -73,12 +73,14 @@ def analizar_tridente(symbol):
     except: pass
 
 def iniciar():
-    print("--- TRIDENTE DE KALOR X20 INICIADO (SIN CMC) ---")
+    print("--- TRIDENTE DE KALOR X20 INICIADO (CICLOS DE 2 MIN) ---")
     while True:
         activos = obtener_activos_volumen()
         for a in activos:
             analizar_tridente(a)
             time.sleep(0.2)
-        time.sleep(300)
+        
+        print("\n⏳ Ciclo completado. Esperando 2 minutos para el próximo escaneo...")
+        time.sleep(120) # <--- Cambio realizado de 300 a 120
 
 if __name__ == "__main__": iniciar()

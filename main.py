@@ -1,119 +1,84 @@
 import os
 import time
-import requests
-from pybit.unified_trading import HTTP
 import pandas as pd
+import pandas_ta as ta
+from pybit.unified_trading import HTTP
 
-# --- CONFIGURACIÓN (Usa variables de entorno en Railway) ---
-CMC_API_KEY = os.getenv("CMC_API_KEY")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+# --- CONFIGURACIÓN DE VARIABLES ---
+API_KEY = os.getenv('BYBIT_API_KEY')
+API_SECRET = os.getenv('BYBIT_API_SECRET')
 
-# Configuración técnica
-LEVERAGE = 20
-CAPITAL_PER_TRADE = 0.20  # 20%
-TIMEFRAME = "15"          # 15 minutos
-
-# Inicializar sesión de Bybit
+# Conexión a Bybit
 session = HTTP(
     testnet=False,
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
+    api_key=API_KEY,
+    api_secret=API_SECRET,
 )
 
-def get_target_assets():
-    """Obtiene ranking 11-50 de CMC y filtra por disponibilidad en Bybit"""
-    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-    params = {'start': '11', 'limit': '40', 'convert': 'USD'}
-    headers = {'X-CMC_PRO_API_KEY': CMC_API_KEY}
-    
+def obtener_activos_por_volumen():
+    """Obtiene los activos de Bybit y filtra del puesto 11 al 50 por volumen"""
     try:
-        # 1. CMC
-        resp = requests.get(url, params=params, headers=headers).json()
-        ranking_symbols = [m['symbol'] + "USDT" for m in resp['data']]
+        # 1. Obtener todos los tickers de futuros (linear)
+        tickers = session.get_tickers(category="linear")['result']['list']
         
-        # 2. Bybit Validation
-        info = session.get_instruments_info(category="linear")
-        bybit_list = [i['symbol'] for i in info['result']['list'] if i['status'] == "Trading"]
+        # 2. Filtrar solo los que son contra USDT y pasar volumen a número
+        df_tickers = pd.DataFrame(tickers)
+        df_tickers = df_tickers[df_tickers['symbol'].str.endswith('USDT')].copy()
+        df_tickers['turnover24h'] = pd.to_numeric(df_tickers['turnover24h'])
         
-        return [s for s in ranking_symbols if s in bybit_list]
+        # 3. Ordenar por volumen de mayor a menor
+        df_sorted = df_tickers.sort_values(by='turnover24h', ascending=False)
+        
+        # 4. Seleccionar del puesto 11 al 50 (índice 10 al 49)
+        seleccionados = df_sorted.iloc[10:50]['symbol'].tolist()
+        
+        print(f"✅ Escaneando {len(seleccionados)} activos (Puestos 11-50 por volumen en Bybit)")
+        return seleccionados
     except Exception as e:
-        print(f"Error obteniendo activos: {e}")
+        print(f"❌ Error obteniendo activos de Bybit: {e}")
         return []
 
-def calculate_emas(symbol):
-    """Calcula las 4 EMAs del Tridente (21, 55, 144, 233)"""
+def calcular_tridente(symbol):
+    """Calcula las EMAs 21, 55, 144, 233 y busca la señal"""
     try:
-        klines = session.get_kline(category="linear", symbol=symbol, interval=TIMEFRAME, limit=300)
-        data = klines['result']['list']
-        df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'turnover'])
-        df['close'] = df['close'].astype(float)
-        df = df.iloc[::-1] # Invertir para orden cronológico
-
-        df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-        df['ema55'] = df['close'].ewm(span=55, adjust=False).mean()
-        df['ema144'] = df['close'].ewm(span=144, adjust=False).mean()
-        df['ema233'] = df['close'].ewm(span=233, adjust=False).mean()
-        
-        return df.iloc[-1], df.iloc[-2] # Última vela y anterior
-    except:
-        return None, None
-
-def execute_trade(symbol, side, price):
-    """Abre la operación con el 20% del capital y x20 leverage"""
-    try:
-        # 1. Balance
-        res = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-        balance = float(res['result']['list'][0]['coin'][0]['availableToWithdraw'])
-        
-        amount_to_invest = balance * CAPITAL_PER_TRADE
-        qty = round((amount_to_invest * LEVERAGE) / price, 3)
-
-        # 2. Configurar Leverage
-        session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(LEVERAGE), sellLeverage=str(LEVERAGE))
-
-        # 3. TP/SL (Basado en ROI 500% y 30%)
-        tp = price * 1.25 if side == "Buy" else price * 0.75
-        sl = price * 0.985 if side == "Buy" else price * 1.015
-
-        # 4. Orden
-        session.place_order(
+        # Obtener velas de 1 hora (60 min)
+        klines = session.get_mark_price_kline(
             category="linear",
             symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=str(qty),
-            takeProfit=str(round(tp, 4)),
-            stopLoss=str(round(sl, 4)),
-            tpTriggerBy="MarkPrice",
-            slTriggerBy="MarkPrice"
-        )
-        print(f"✅ OPERACIÓN ABIERTA EN {symbol} | Lado: {side} | Qty: {qty}")
-    except Exception as e:
-        print(f"❌ Error ejecutando trade en {symbol}: {e}")
-
-def run_tridente_bot():
-    print("--- BOT TRIDENTE DE KALOR INICIADO ---")
-    while True:
-        activos = get_target_assets()
+            interval=60,
+            limit=300
+        )['result']['list']
         
-        for symbol in activos:
-            last_v, prev_v = calculate_emas(symbol)
-            if last_v is None: continue
+        df = pd.DataFrame(klines, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'turnover'])
+        df['close'] = pd.to_numeric(df['close'])
+        
+        # Calcular EMAs del Tridente
+        df['ema21'] = ta.ema(df['close'], length=21)
+        df['ema55'] = ta.ema(df['close'], length=55)
+        df['ema144'] = ta.ema(df['close'], length=144)
+        df['ema233'] = ta.ema(df['close'], length=233)
+        
+        last = df.iloc[-1]
+        
+        # Lógica simple: Precio por encima de las 4 EMAs = Posible Long
+        if last['close'] > last['ema21'] > last['ema55'] > last['ema144'] > last['ema233']:
+            print(f"🚀 ¡SEÑAL TRIDENTE EN {symbol}! Tendencia alcista fuerte.")
+            # Aquí podrías agregar la función para ejecutar la orden
+            
+    except Exception as e:
+        pass # Ignorar errores de activos específicos
 
-            # CONDICIÓN: ABANICO ABIERTO (LONG)
-            long_cond = (last_v['ema21'] > last_v['ema55'] > last_v['ema144'] > last_v['ema233'])
-            # CONDICIÓN: RETROCESO A EMA 144/233
-            touch_ema = (last_v['low'] <= last_v['ema144'] or last_v['low'] <= last_v['ema233'])
-            # CONFIRMACIÓN: VELA VERDE
-            confirm = (last_v['close'] > last_v['open'])
-
-            if long_cond and touch_ema and confirm:
-                execute_trade(symbol, "Buy", last_v['close'])
-                time.sleep(10) # Pausa para evitar doble entrada
-
-        print("Escaneo completado. Esperando 5 min para siguiente ciclo...")
+def iniciar_bot():
+    print("--- BOT TRIDENTE DE KALOR (MODO BYBIT DIRECTO) ---")
+    while True:
+        activos = obtener_activos_por_volumen()
+        
+        for activo in activos:
+            calcular_tridente(activo)
+            time.sleep(0.2) # Pausa técnica para evitar bloqueos
+            
+        print("\n⏳ Ciclo completado. Esperando 5 minutos para el próximo escaneo...")
         time.sleep(300)
 
 if __name__ == "__main__":
-    run_tridente_bot()
+    iniciar_bot()

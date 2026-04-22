@@ -1,4 +1,4 @@
 pandas
-pandas-ta
+pandas-ta-classic
 pybit
 

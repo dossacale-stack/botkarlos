@@ -1,7 +1,7 @@
 import os
 import time
 import pandas as pd
-import pandas_ta_classic as ta
+import pandas_ta as ta
 import logging
 from pybit.unified_trading import HTTP
 
@@ -27,8 +27,8 @@ session = HTTP(
 
 class TridenteAuctionSniper:
     def __init__(self):
-        self.blacklist = {}  # Cooldown post-operación
-        self.watchlist = {}  # ✅ MEJORA: Monedas en "seguimiento cercano"
+        self.blacklist = {}  
+        self.watchlist = {}  # Memoria de persecución activa
 
     def get_balance(self):
         try:
@@ -50,12 +50,12 @@ class TridenteAuctionSniper:
             df['turnover24h'] = pd.to_numeric(df['turnover24h'])
             df = df.sort_values(by='turnover24h', ascending=False)
             
-            # Puestos 11-30
+            # Puestos 11-30 (Zona de alta probabilidad)
             elite_list = df.iloc[10:30]['symbol'].tolist()
             
-            # ✅ Unimos la lista del escaneo con la Watchlist de persecución
+            # Unimos escaneo fresco con los objetivos que ya estamos persiguiendo
             total_a_revisar = list(set(elite_list + list(self.watchlist.keys())))
-            logging.info(f"🔎 Escaneo: {len(elite_list)} nuevos + {len(self.watchlist)} en persecución. Total: {len(total_a_revisar)}")
+            logging.info(f"🔎 Radar: {len(elite_list)} en subasta + {len(self.watchlist)} perseguidos.")
             return total_a_revisar
         except Exception as e:
             logging.error(f"Error en escaneo: {e}")
@@ -72,11 +72,11 @@ class TridenteAuctionSniper:
         except: return None
 
     def analizar(self, symbol):
-        """Cerebro con Modo Persecución"""
+        """Cerebro v3.4: Gatillo Sensible y Persecución Dinámica"""
         try:
             open_positions = self.get_open_positions()
             if symbol in open_positions: 
-                self.watchlist.pop(symbol, None) # Si ya abrió, sale de watchlist
+                self.watchlist.pop(symbol, None)
                 return
             
             if symbol in self.blacklist and time.time() < self.blacklist[symbol]: return
@@ -97,31 +97,27 @@ class TridenteAuctionSniper:
             compradores_dominan = val['ema55'] > val['ema144'] and val['ema55'] > val['ema233']
             vendedores_dominan = val['ema55'] < val['ema144'] and val['ema55'] < val['ema233']
 
-            # --- LÓGICA DE PERSECUCIÓN (WATCHLIST) ---
-            # Si cumple tendencia y RSI pero falta el nivel crítico, lo seguimos
-            en_zona_interes = False
+            # --- LÓGICA DE APROXIMACIÓN (Gatillo más permisivo) ---
             
-            if compradores_dominan and rsi_h1 <= 40 and rsi_15 < 45:
-                en_zona_interes = True
-                # Disparo real
-                if val['low'] <= niveles['pdl'] * 1.002 or val['low'] <= niveles['pwl'] * 1.002:
+            # Flexibilizamos RSI (Casi Long / Casi Short)
+            casi_long = compradores_dominan and rsi_h1 <= 45 and rsi_15 < 50
+            casi_short = vendedores_dominan and rsi_h1 >= 55 and rsi_15 > 50
+
+            if casi_long or casi_short:
+                if symbol not in self.watchlist:
+                    logging.info(f"🎯 OBJETIVO EN MIRA: {symbol} añadido a persecución activa.")
+                self.watchlist[symbol] = time.time()
+                
+                # DISPARO REAL (Ahora con margen del 0.8% - Antes 0.2%)
+                if casi_long and (val['low'] <= niveles['pdl'] * 1.008 or val['low'] <= niveles['pwl'] * 1.008):
                     self.ejecutar(symbol, "Buy", val['close'])
                     return
 
-            elif vendedores_dominan and rsi_h1 >= 60 and rsi_15 > 55:
-                en_zona_interes = True
-                # Disparo real
-                if val['high'] >= niveles['pdh'] * 0.998 or val['high'] >= niveles['pwh'] * 0.998:
+                elif casi_short and (val['high'] >= niveles['pdh'] * 0.992 or val['high'] >= niveles['pwh'] * 0.992):
                     self.ejecutar(symbol, "Sell", val['close'])
                     return
-
-            # ✅ Manejo de la Watchlist
-            if en_zona_interes:
-                if symbol not in self.watchlist:
-                    logging.info(f"🎯 Moneda en la mira: {symbol} añadida a Watchlist de persecución.")
-                self.watchlist[symbol] = time.time() # Actualizamos marca de tiempo
             else:
-                # Si ya no cumple ni siquiera la zona de interés, sale de la watchlist
+                # Si el activo se enfría, sale de la watchlist
                 if symbol in self.watchlist:
                     self.watchlist.pop(symbol, None)
 
@@ -150,8 +146,8 @@ class TridenteAuctionSniper:
             )
             
             self.blacklist[symbol] = time.time() + 600 
-            self.watchlist.pop(symbol, None) # Limpiamos de la watchlist al ejecutar
-            logging.info(f"🚀 {side} EJECUTADO en {symbol} | Qty:{qty} | SL:{sl:.4f}")
+            self.watchlist.pop(symbol, None)
+            logging.info(f"🚀 {side} EJECUTADO en {symbol} | Qty:{qty} | SL:{sl:.4f} | TP:{tp:.4f}")
             
         except Exception as e: 
             logging.error(f"Error ejecución {symbol}: {e}")
@@ -163,14 +159,14 @@ class TridenteAuctionSniper:
         return df
 
     def iniciar(self):
-        logging.info("--- TRIDENTE SNIPER v3.3: MODO PERSECUCIÓN ACTIVADO ---")
+        logging.info("--- TRIDENTE SNIPER v3.4: GATILLO SENSIBLE ACTIVADO ---")
         while True:
             try:
                 activos = self.obtener_activos_subasta()
                 for s in activos:
                     self.analizar(s)
                     time.sleep(0.5)
-                # Limpieza de watchlist: si una moneda lleva más de 1 hora sin dar entrada, sale.
+                # Limpieza: si un objetivo lleva 1 hora sin dar entrada, se descarta para buscar sangre nueva
                 self.watchlist = {k: v for k, v in self.watchlist.items() if time.time() - v < 3600}
                 time.sleep(CYCLE_INTERVAL)
             except Exception as e:
